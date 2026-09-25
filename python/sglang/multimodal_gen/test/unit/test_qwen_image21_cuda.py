@@ -484,11 +484,17 @@ def test_vae_fast_path_folds_every_conv_bias(monkeypatch):
     shortcuts = sum(isinstance(b.conv_shortcut, torch.nn.Conv2d) for b in blocks)
     assert blocks and shortcuts, "config must exercise a conv_shortcut"
 
-    conv_calls, epilogues, norm_pre_bias = [], [], []
-    real_conv2d, real_epilogue, real_norm = (
+    up_blocks = [
+        m for m in vae.decoder.modules() if isinstance(m, opt._GatedResidualUpBlock)
+    ]
+    assert up_blocks, "config must exercise an upsampling residual up block"
+
+    conv_calls, epilogues, norm_pre_bias, dup_adds = [], [], [], []
+    real_conv2d, real_epilogue, real_norm, real_dup = (
         F.conv2d,
         opt.conv_bias_epilogue,
         opt.wan_rmsnorm_silu,
+        opt.dup_up3d_add,
     )
 
     def conv2d(x, weight, bias=None, *args, **kwargs):
@@ -503,9 +509,14 @@ def test_vae_fast_path_folds_every_conv_bias(monkeypatch):
         norm_pre_bias.append(kwargs.get("pre_bias") is not None)
         return real_norm(x, gamma, bias, **kwargs)
 
+    def dup_add(main, src, *args, main_bias=None):
+        dup_adds.append(main_bias is not None)
+        return real_dup(main, src, *args, main_bias=main_bias)
+
     monkeypatch.setattr(F, "conv2d", conv2d)
     monkeypatch.setattr(opt, "conv_bias_epilogue", epilogue)
     monkeypatch.setattr(opt, "wan_rmsnorm_silu", norm)
+    monkeypatch.setattr(opt, "dup_up3d_add", dup_add)
     latent = torch.randn(1, 4, 1, 4, 6, device="cuda", dtype=torch.bfloat16)
     with use_vae_fast_path(vae, True):
         vae.decoder(latent, first_chunk=True)
@@ -515,6 +526,8 @@ def test_vae_fast_path_folds_every_conv_bias(monkeypatch):
     assert sum(with_bias for _, with_bias in epilogues) == shortcuts
     # conv1's bias absorbed by the fused norm2 in every block, nowhere else
     assert sum(norm_pre_bias) == len(blocks)
+    # every up block folded its upsample conv's bias into the DupUp3D add
+    assert len(dup_adds) == len(up_blocks) and all(dup_adds)
     # with the gate off the convs add their own bias again
     conv_calls.clear()
     vae.decoder(latent, first_chunk=True)

@@ -10,8 +10,9 @@ and no conv adds its bias on its own. aten runs ``cudnn_convolution`` and then
 a separate broadcast ``add_`` over the whole activation, so inside a residual
 block the bias of ``conv1`` is deferred into the fused RMSNorm+SiLU that
 consumes it, and the bias of ``conv2``, the bias of ``conv_shortcut`` and the
-residual add run as one bit-exact epilogue pass. With the gate off the
-original module code runs bit-for-bit. Installed once at VAE load;
+residual add run as one bit-exact epilogue pass; the up blocks' upsample conv
+defers its bias into the fused ``main + DupUp3D(src)`` add. With the gate off
+the original module code runs bit-for-bit. Installed once at VAE load;
 all-or-nothing and fail-closed like the Wan-family path.
 """
 
@@ -22,7 +23,9 @@ import torch.nn.functional as F
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import (
     AutoencoderKLQwenImage21,
     QwenImage21CausalConv3d,
+    QwenImage21DupUp3D,
     QwenImage21ResidualBlock,
+    QwenImage21ResidualUpBlock,
     QwenImage21RMS_norm,
     QwenImage21Upsample,
 )
@@ -42,6 +45,7 @@ try:
         can_use_conv_bias_epilogue,
         can_use_wan_rmsnorm_silu,
         conv_bias_epilogue,
+        dup_up3d_add,
         wan_rmsnorm_silu,
     )
 
@@ -158,7 +162,10 @@ class _GatedCausalConv3d(QwenImage21CausalConv3d):
 class _GatedConv2d(nn.Conv2d):
     """Plain ``nn.Conv2d`` (Resample and attention projections) running
     channels_last while the gate is on, with its bias applied by the
-    vectorised epilogue instead of aten's broadcast ``add_``."""
+    vectorised epilogue instead of aten's broadcast ``add_``. A conv marked
+    ``_sgl_defer_bias`` (an up block's upsample conv, whose output only feeds
+    the DupUp3D residual add) returns its raw output and the owning
+    :class:`_GatedResidualUpBlock` folds the bias there."""
 
     def forward(self, x):
         if not self._sgl_gate.enabled or torch.compiler.is_compiling():
@@ -172,7 +179,8 @@ class _GatedConv2d(nn.Conv2d):
             self.dilation,
             self.groups,
         )
-        return _conv_epilogue(y, self.bias, None, None)
+        bias = None if self.__dict__.get("_sgl_defer_bias") else self.bias
+        return _conv_epilogue(y, bias, None, None)
 
 
 class _GatedRMSNormSiLU(QwenImage21RMS_norm):
@@ -229,6 +237,39 @@ class _GatedResidualBlock(QwenImage21ResidualBlock):
         x = self.nonlinearity(x)
         x = self.dropout(x)
         return self.conv2(x, residual=h, residual_bias=h_bias)
+
+
+class _GatedResidualUpBlock(QwenImage21ResidualUpBlock):
+    """``QwenImage21ResidualUpBlock`` whose upsample conv defers its bias into
+    the fused ``main + DupUp3D(src)`` add while the gate is on (the conv output
+    is the largest activation of its level, so its separate bias pass was the
+    costliest one left). Same arithmetic order and rounding as the eager
+    block."""
+
+    def forward(self, x, feat_cache=None, feat_idx=None, first_chunk=False):
+        if not self._sgl_gate.enabled or torch.compiler.is_compiling():
+            return QwenImage21ResidualUpBlock.forward(
+                self, x, feat_cache, feat_idx, first_chunk
+            )
+        x_copy = x
+        for resnet in self.resnets:
+            x = resnet(x)
+        x = self.upsampler(x)  # raw: its conv carries ``_sgl_defer_bias``
+        bias = self.upsampler.resample[1].bias
+        shortcut = self.avg_shortcut
+        fused = dup_up3d_add(
+            x,
+            x_copy,
+            shortcut.factor_t,
+            shortcut.factor_s,
+            shortcut.repeats,
+            first_chunk,
+            main_bias=bias,
+        )
+        if fused is not None:
+            return fused
+        x = _add_bias(x, bias)
+        return x + shortcut(x_copy, first_chunk=first_chunk)
 
 
 def _norm_silu_pairs(part: nn.Module) -> list[tuple[nn.Module, str, nn.Module, str]]:
@@ -294,6 +335,24 @@ def _install(part: nn.Module, gate: VaeFastPathGate) -> tuple[int, int, int] | N
         if isinstance(seq, nn.Sequential) and type(seq[0]) is QwenImage21Upsample:
             seq[0] = GatedChannelsLastUpsample(seq[0], gate)
             upsamples += 1
+    for m in part.modules():
+        if not (
+            type(m) is QwenImage21ResidualUpBlock
+            and m.upsampler is not None
+            and type(m.avg_shortcut) is QwenImage21DupUp3D
+        ):
+            continue
+        seq = getattr(m.upsampler, "resample", None)
+        if not (
+            isinstance(seq, nn.Sequential)
+            and len(seq) == 2
+            and type(seq[1]) is _GatedConv2d
+            and seq[1].bias is not None
+        ):
+            continue
+        seq[1]._sgl_defer_bias = True
+        m.__class__ = _GatedResidualUpBlock
+        m._sgl_gate = gate
     return len(pairs), convs, upsamples
 
 

@@ -583,7 +583,8 @@ def test_cat_pad_channels_last_3d_bitwise(dtype, c, t, h, w, cache_t, pads):
         (64, 32, 2, 10, 14, 1, 2, False),
     ],
 )
-def test_dup_up3d_add_bitwise(dtype, c_in, c_out, t, h, w, ft, fs, drop):
+@pytest.mark.parametrize("with_bias", [False, True], ids=["plain", "main_bias"])
+def test_dup_up3d_add_bitwise(dtype, c_in, c_out, t, h, w, ft, fs, drop, with_bias):
     torch.cuda.manual_seed(0)
     repeats = c_out * ft * fs * fs // c_in
     src = _cl3d((1, c_in, t, h, w), dtype)
@@ -592,6 +593,11 @@ def test_dup_up3d_add_bitwise(dtype, c_in, c_out, t, h, w, ft, fs, drop):
     main = torch.randn(
         (1, t_out, c_out, h * fs, w * fs), device=DEVICE, dtype=dtype
     ).permute(0, 2, 1, 3, 4)
+    # A deferred conv bias enters as aten's ``main.add_(bias)`` (fp32 opmath,
+    # one rounding) before the residual add; ``main`` is then the raw conv
+    # output and the reference chain adds the bias first.
+    bias = torch.randn(c_out, device=DEVICE, dtype=dtype) if with_bias else None
+    biased = main if bias is None else main + bias.view(1, -1, 1, 1, 1)
 
     dup = src.repeat_interleave(repeats, dim=1)
     dup = dup.view(1, c_out, ft, fs, fs, t, h, w)
@@ -599,9 +605,9 @@ def test_dup_up3d_add_bitwise(dtype, c_in, c_out, t, h, w, ft, fs, drop):
     dup = dup.view(1, c_out, t * ft, h * fs, w * fs)
     if drop:
         dup = dup[:, :, ft - 1 :, :, :]
-    ref = main + dup
+    ref = biased + dup
 
-    out = dup_up3d_add(main, src, ft, fs, repeats, drop)
+    out = dup_up3d_add(main, src, ft, fs, repeats, drop, main_bias=bias)
     assert out is not None and out.shape == ref.shape
     # Layout must match the aten add output exactly (downstream reductions
     # are layout-sensitive), and every value must be bitwise identical.

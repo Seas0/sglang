@@ -211,6 +211,7 @@ def cat_pad_channels_last_3d(
 def _dup_up3d_add_kernel(
     main_ptr,
     src_ptr,
+    main_bias_ptr,
     out_ptr,
     total,
     C_out,
@@ -237,6 +238,7 @@ def _dup_up3d_add_kernel(
     FS: tl.constexpr,
     REPEATS: tl.constexpr,
     CHANNELS_INNER: tl.constexpr,
+    HAS_MAIN_BIAS: tl.constexpr,
     IDX64: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -287,11 +289,17 @@ def _dup_up3d_add_kernel(
     m_off = ob * smb + oc * smc + o_t * smt + oh * smh + ow * smw
     s_off = ob * ssb + ci * ssc + ti * sst + hi * ssh + wi * ssw
     o_off = ob * sob + oc * soc + o_t * sot + oh * soh + ow * sow
-    m = tl.load(main_ptr + m_off, mask=mask, other=0.0)
+    m = tl.load(main_ptr + m_off, mask=mask, other=0.0).to(tl.float32)
+    if HAS_MAIN_BIAS:
+        # ``main`` is a raw conv output whose bias was deferred here: apply it
+        # as aten's add_ would (fp32 opmath, one rounding to main's dtype)
+        # before the residual add.
+        b = tl.load(main_bias_ptr + oc, mask=mask, other=0.0).to(tl.float32)
+        m = (m + b).to(out_ptr.dtype.element_ty).to(tl.float32)
     s = tl.load(src_ptr + s_off, mask=mask, other=0.0)
     # Accumulate in fp32 and round once on store, matching aten's opmath
     # behaviour for half-precision adds.
-    vals = m.to(tl.float32) + s.to(tl.float32)
+    vals = m + s.to(tl.float32)
     tl.store(out_ptr + o_off, vals, mask=mask)
 
 
@@ -302,13 +310,16 @@ def dup_up3d_add(
     factor_s: int,
     repeats: int,
     drop_first_frames: bool,
+    main_bias: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """``main + DupUp3D(src)`` in one pass (output layout follows ``main``).
 
     ``src`` is the DupUp3D input ``(B, C_in, T, H, W)``; ``main`` must match
     the DupUp3D output shape. ``drop_first_frames`` mirrors the
-    ``first_chunk`` slicing (``x[:, :, factor_t - 1 :]``). Returns ``None``
-    when unsupported so callers can fall back.
+    ``first_chunk`` slicing (``x[:, :, factor_t - 1 :]``). ``main_bias`` (one
+    value per output channel) is the deferred bias of the conv that produced
+    ``main``, applied first with the rounding of ``main.add_(bias)``. Returns
+    ``None`` when unsupported so callers can fall back.
     """
     if main.dim() != 5 or src.dim() != 5:
         return None
@@ -336,6 +347,15 @@ def dup_up3d_add(
     )
     if tuple(main.shape) != exp_shape:
         return None
+    if main_bias is not None:
+        if (
+            main_bias.device != main.device
+            or main_bias.numel() != exp_shape[1]
+            or main_bias.dtype not in (main.dtype, torch.float32)
+        ):
+            return None
+        # Same cast autocast applies to a conv bias before the conv call.
+        main_bias = main_bias.reshape(-1).to(main.dtype).contiguous()
 
     # ``empty_like`` preserves the stride order of the dense ``main`` view —
     # the same layout the aten ``main + dup`` would produce — so downstream
@@ -354,6 +374,7 @@ def dup_up3d_add(
         _dup_up3d_add_kernel[grid](
             main,
             src,
+            main if main_bias is None else main_bias,
             out,
             total,
             exp_shape[1],
@@ -380,6 +401,7 @@ def dup_up3d_add(
             FS=factor_s,
             REPEATS=repeats,
             CHANNELS_INNER=out.stride(1) == 1 and exp_shape[1] > 1,
+            HAS_MAIN_BIAS=main_bias is not None,
             IDX64=total >= _MAX_INT32,
             BLOCK=BLOCK,
         )
