@@ -184,10 +184,11 @@ text prompt; precomputed embeddings alone are insufficient.
   boundaries. With two or more GPUs, **Spatial shard** distributes full-image
   decoding without enabling tiling; floating-point rounding can still differ.
   `--quality extra-high` (or `high`) switches the VAE to a channels_last fast
-  path with fused RMSNorm+SiLU for both encode and decode; on one A800 at
-  1024×1024 that took decode from 181 ms to 135 ms and edit conditioning from
-  259 ms to 240 ms with edit output at SSIM 0.9988 / 43 dB against the
-  lossless default, which stays bit-exact.
+  path with fused RMSNorm+SiLU and fused conv-bias epilogues for both encode
+  and decode; on one RTX 4090 at 1024×1024 that took decode from 246 ms to
+  154 ms for text-to-image and edit alike, with output at SSIM 0.9997 (t2i)
+  and 0.9988 / 43 dB (edit) against the lossless default, which stays
+  bit-exact.
 
 See the [compatibility inventory](/docs/sglang-diffusion/compatibility_matrix)
 for configuration support and the

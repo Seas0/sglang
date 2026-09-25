@@ -129,8 +129,15 @@ framework-specific optimization workflow.
   (`runtime/models/vaes/qwen_image21_vae_cuda_opt.py`) is a separate class
   with the same gate: channels_last convs with cuDNN padding (no `F.pad`
   copies, no NCHW/NHWC transposes), the fused RMSNorm+SiLU, and the NHWC
-  nearest upsample, on encode and decode. Left on the table there: the conv
-  bias is still a separate `add_` per conv (about 10% of decode).
+  nearest upsample, on encode and decode. No conv there adds its own bias
+  (aten's separate broadcast `add_` after `cudnn_convolution`): inside a
+  residual block `conv1`'s bias is deferred into the fused norm2+SiLU
+  (`pre_bias`), `conv2`'s bias, the `conv_shortcut` bias and the residual
+  add are one `conv_bias_epilogue` pass, the up blocks' upsample conv bias
+  goes into `dup_up3d_add(main_bias=...)`, and the remaining convs use the
+  bias-only epilogue. All of those reproduce aten's arithmetic bit for bit,
+  so they change no pixel of the gated path; what is left in decode is the
+  cuDNN convs themselves (about 86% of GPU time on a 4090).
 - Do not confuse request `--quality` with `--output-quality`, which controls
   output-file compression rather than model math.
 - Validation: `test/registered/kernels/ops/diffusion/test_sites.py`,
