@@ -193,6 +193,7 @@ Every kernel here only moves values (plus zero fill, plus at most one same-order
 | `causal_conv3d_cat_pad` | KDA (JIT CUDA) / Triton | causal Conv3d `cat` + `pad` |
 | `cat_pad_channels_last_3d` | Triton | Wan causal VAE `cat + F.pad + contiguous` (three passes plus cache bookkeeping) in one pass |
 | `dup_up3d_add` | Triton | `repeat_interleave + permute().contiguous() + add` |
+| `avg_down3d_add` | Triton | Wan 2.2-style residual down block `F.pad + permute().contiguous() + mean + add`, reading the channels_last activation in place, with the downsample conv's bias folded in |
 
 Joy Image Edit uses the joint-copy path for eligible CUDA FP16/BF16 image
 tensors of at least 32 MiB. It preserves image-first token order, copies

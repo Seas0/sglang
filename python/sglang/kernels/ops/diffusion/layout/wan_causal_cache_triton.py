@@ -406,3 +406,215 @@ def dup_up3d_add(
             BLOCK=BLOCK,
         )
     return out
+
+
+@triton.jit
+def _avg_down3d_add_kernel(
+    main_ptr,
+    src_ptr,
+    main_bias_ptr,
+    out_ptr,
+    total,
+    C_out,
+    out_t,
+    out_h,
+    out_w,
+    pad_t,
+    inv_group,
+    smb,
+    smc,
+    smt,
+    smh,
+    smw,
+    ssb,
+    ssc,
+    sst,
+    ssh,
+    ssw,
+    sob,
+    soc,
+    sot,
+    soh,
+    sow,
+    FT: tl.constexpr,
+    FS: tl.constexpr,
+    GROUP: tl.constexpr,
+    CHANNELS_INNER: tl.constexpr,
+    HAS_MAIN_BIAS: tl.constexpr,
+    IDX64: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    if IDX64:
+        offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
+    else:
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total
+
+    # Logical (B, C_out, out_t, out_h, out_w) index in the output's memory
+    # order (channels innermost for an NHWC-style ``main``), as in
+    # ``_dup_up3d_add_kernel``.
+    if CHANNELS_INNER:
+        oc = offs % C_out
+        rest = offs // C_out
+        ow = rest % out_w
+        rest = rest // out_w
+        oh = rest % out_h
+        rest = rest // out_h
+        o_t = rest % out_t
+        ob = rest // out_t
+    else:
+        ow = offs % out_w
+        rest = offs // out_w
+        oh = rest % out_h
+        rest = rest // out_h
+        o_t = rest % out_t
+        rest = rest // out_t
+        oc = rest % C_out
+        ob = rest // C_out
+
+    # AvgDown3D: front-pad T to a multiple of FT with zero frames, pixel-
+    # unshuffle (FT, FS, FS) into the channel dim, then average GROUP
+    # consecutive shuffled channels. Shuffled channel k of output channel
+    # ``oc`` decodes to (ci, rt, rh, rw) with k = ((ci * FT + rt) * FS + rh)
+    # * FS + rw; FT/FS/GROUP are constexpr powers of two, so the div/mod
+    # compile to shifts. aten's ``mean`` accumulates the group in fp32 in
+    # index order and scales once, so do the same.
+    FACTOR: tl.constexpr = FT * FS * FS
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for g in tl.static_range(GROUP):
+        k = oc * GROUP + g
+        ci = k // FACTOR
+        rem = k % FACTOR
+        rt = rem // (FS * FS)
+        rh = (rem // FS) % FS
+        rw = rem % FS
+        ti = o_t * FT + rt - pad_t
+        s_off = (
+            ob * ssb + ci * ssc + ti * sst + (oh * FS + rh) * ssh + (ow * FS + rw) * ssw
+        )
+        s = tl.load(src_ptr + s_off, mask=mask & (ti >= 0), other=0.0)
+        acc = acc + s.to(tl.float32)
+    avg = (acc * inv_group).to(out_ptr.dtype.element_ty).to(tl.float32)
+
+    m_off = ob * smb + oc * smc + o_t * smt + oh * smh + ow * smw
+    o_off = ob * sob + oc * soc + o_t * sot + oh * soh + ow * sow
+    m = tl.load(main_ptr + m_off, mask=mask, other=0.0).to(tl.float32)
+    if HAS_MAIN_BIAS:
+        # ``main`` is a raw conv output whose bias was deferred here (aten
+        # add_: fp32 opmath, one rounding to main's dtype).
+        b = tl.load(main_bias_ptr + oc, mask=mask, other=0.0).to(tl.float32)
+        m = (m + b).to(out_ptr.dtype.element_ty).to(tl.float32)
+    # One fp32 add, one rounding on store, like the aten ``main + avg``.
+    tl.store(out_ptr + o_off, m + avg, mask=mask)
+
+
+def avg_down3d_add(
+    main: torch.Tensor,
+    src: torch.Tensor,
+    factor_t: int,
+    factor_s: int,
+    out_channels: int,
+    main_bias: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """``main + AvgDown3D(src)`` in one pass (output layout follows ``main``).
+
+    ``src`` is the AvgDown3D input ``(B, C_in, T, H, W)``; ``main`` must match
+    the AvgDown3D output shape ``(B, out_channels, ceil(T / factor_t),
+    H / factor_s, W / factor_s)``. The eager module front-pads T with zero
+    frames, pixel-unshuffles ``(factor_t, factor_s, factor_s)`` into the
+    channel dim and averages ``C_in * factor / out_channels`` consecutive
+    shuffled channels; this reads ``src`` in place instead of materialising
+    the padded and the shuffled copies (on a channels_last input the shuffle
+    copy reads with 16x sector amplification). ``main_bias`` is the deferred
+    bias of the conv that produced ``main``, applied first with the rounding
+    of ``main.add_(bias)``. The group mean is accumulated in fp32 in index
+    order and scaled once, as aten's ``mean`` does, so the values match the
+    eager chain up to the reduction order. Returns ``None`` when unsupported
+    so callers can fall back.
+    """
+    if main.dim() != 5 or src.dim() != 5:
+        return None
+    if factor_t & (factor_t - 1) or factor_s & (factor_s - 1):
+        return None
+    if main.device.type not in ("cuda", "xpu") or src.device.type not in (
+        "cuda",
+        "xpu",
+    ):
+        return None
+    if main.dtype != src.dtype or main.device != src.device:
+        return None
+    B, C_in, T, H, W = src.shape
+    factor = factor_t * factor_s * factor_s
+    if H % factor_s or W % factor_s or (C_in * factor) % out_channels:
+        return None
+    group = C_in * factor // out_channels
+    # Power-of-two groups keep the unshuffle math on shifts; 16 bounds the
+    # unrolled accumulation (Wan 2.2 / Qwen-Image 2.1 use 1 and 4).
+    if group & (group - 1) or group > 16:
+        return None
+    pad_t = (factor_t - T % factor_t) % factor_t
+    exp_shape = (
+        B,
+        out_channels,
+        (T + pad_t) // factor_t,
+        H // factor_s,
+        W // factor_s,
+    )
+    if tuple(main.shape) != exp_shape:
+        return None
+    if main_bias is not None:
+        if (
+            main_bias.device != main.device
+            or main_bias.numel() != out_channels
+            or main_bias.dtype not in (main.dtype, torch.float32)
+        ):
+            return None
+        main_bias = main_bias.reshape(-1).to(main.dtype).contiguous()
+
+    out = torch.empty_like(main)
+    total = out.numel()
+    if total == 0 or total > _MAX_INT32 * 4:
+        return None
+
+    smb, smc, smt, smh, smw = main.stride()
+    ssb, ssc, sst, ssh, ssw = src.stride()
+    sob, soc, sot, soh, sow = out.stride()
+    BLOCK = 512
+    grid = (triton.cdiv(total, BLOCK),)
+    with torch.get_device_module().device(main.device):
+        _avg_down3d_add_kernel[grid](
+            main,
+            src,
+            main if main_bias is None else main_bias,
+            out,
+            total,
+            exp_shape[1],
+            exp_shape[2],
+            exp_shape[3],
+            exp_shape[4],
+            pad_t,
+            1.0 / group,
+            smb,
+            smc,
+            smt,
+            smh,
+            smw,
+            ssb,
+            ssc,
+            sst,
+            ssh,
+            ssw,
+            sob,
+            soc,
+            sot,
+            soh,
+            sow,
+            FT=factor_t,
+            FS=factor_s,
+            GROUP=group,
+            CHANNELS_INNER=out.stride(1) == 1 and exp_shape[1] > 1,
+            HAS_MAIN_BIAS=main_bias is not None,
+            IDX64=total >= _MAX_INT32,
+            BLOCK=BLOCK,
+        )
+    return out

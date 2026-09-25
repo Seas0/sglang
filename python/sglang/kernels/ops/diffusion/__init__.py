@@ -512,6 +512,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Wan causal VAE main + DupUp3D(src).",
     ),
     (
+        "diffusion.avg_down3d_add",
+        KernelBackend.TRITON,
+        "layout.wan_causal_cache_triton:avg_down3d_add",
+        _CUDA,
+        "Wan causal VAE main + AvgDown3D(src).",
+    ),
+    (
         "diffusion.nearest_upsample_nhwc",
         KernelBackend.TRITON,
         "layout.nearest_upsample_nhwc_triton:nearest_upsample_nhwc",
@@ -698,6 +705,7 @@ _EXPORTS: dict[str, str] = {
     "fused_scatter_to_padded": "layout.varlen_pack_pad_triton",
     "cat_pad_channels_last_3d": "layout.wan_causal_cache_triton",
     "dup_up3d_add": "layout.wan_causal_cache_triton",
+    "avg_down3d_add": "layout.wan_causal_cache_triton",
     "nearest_upsample_nhwc": "layout.nearest_upsample_nhwc_triton",
     "can_use_nearest_upsample_nhwc": "layout.nearest_upsample_nhwc_triton",
     "try_flux2_token_cat_nvfp4": "layout.flux2_token_cat_nvfp4_jit",

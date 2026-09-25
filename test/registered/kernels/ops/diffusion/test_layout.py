@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.kernels.ops.diffusion import (
+    avg_down3d_add,
     build_inv_indices,
     can_use_nearest_upsample_nhwc,
     can_use_usp_merge_heads,
@@ -613,6 +614,56 @@ def test_dup_up3d_add_bitwise(dtype, c_in, c_out, t, h, w, ft, fs, drop, with_bi
     # are layout-sensitive), and every value must be bitwise identical.
     assert out.stride() == ref.stride()
     assert torch.equal(out, ref)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "c_in,c_out,t,h,w,ft,fs",
+    [
+        (96, 96, 1, 20, 28, 1, 2),  # Qwen-Image 2.1 encoder level 0: 2x2 mean
+        (96, 192, 1, 20, 28, 2, 2),  # temporal factor: T front-padded 1 -> 2
+        (64, 32, 2, 20, 28, 2, 2),  # no padding, 16-wide group
+        (768, 768, 1, 8, 8, 1, 1),  # last block: identity shortcut (group 1)
+    ],
+)
+@pytest.mark.parametrize("with_bias", [False, True], ids=["plain", "main_bias"])
+def test_avg_down3d_add_matches_eager(dtype, c_in, c_out, t, h, w, ft, fs, with_bias):
+    torch.cuda.manual_seed(0)
+    src = _cl3d((1, c_in, t, h, w), dtype)
+    pad_t = (ft - t % ft) % ft
+    t_out = (t + pad_t) // ft
+    # Main arm as a permuted view, like the Resample 2D output.
+    main = torch.randn(
+        (1, t_out, c_out, h // fs, w // fs), device=DEVICE, dtype=dtype
+    ).permute(0, 2, 1, 3, 4)
+    bias = torch.randn(c_out, device=DEVICE, dtype=dtype) if with_bias else None
+    biased = main if bias is None else main + bias.view(1, -1, 1, 1, 1)
+
+    # The eager QwenImage21AvgDown3D chain, op for op.
+    factor = ft * fs * fs
+    x = torch.nn.functional.pad(src, (0, 0, 0, 0, pad_t, 0))
+    x = x.view(1, c_in, t_out, ft, h // fs, fs, w // fs, fs)
+    x = x.permute(0, 1, 3, 5, 7, 2, 4, 6).contiguous()
+    x = x.view(1, c_in * factor, t_out, h // fs, w // fs)
+    x = x.view(1, c_out, c_in * factor // c_out, t_out, h // fs, w // fs)
+    ref = biased + x.mean(dim=2)
+
+    out = avg_down3d_add(main, src, ft, fs, c_out, main_bias=bias)
+    assert out is not None and out.shape == ref.shape
+    # Same memory layout as the aten result (size-1 dims carry no stride).
+    assert [s for s, n in zip(out.stride(), out.shape) if n > 1] == [
+        s for s, n in zip(ref.stride(), ref.shape) if n > 1
+    ]
+    # The group mean is accumulated in fp32 in index order like aten's
+    # ``mean``, so the values agree bitwise for the groups the Wan 2.2 /
+    # Qwen-Image 2.1 encoders use (1 and 4); aten reduces a 16-wide group in a
+    # different order, one fp32 ulp of the accumulator apart before the
+    # half-precision rounding.
+    if c_in * factor // c_out <= 4:
+        assert torch.equal(out, ref)
+    else:
+        torch.testing.assert_close(out, ref, atol=1e-6, rtol=1e-6)
 
 
 @torch.no_grad()

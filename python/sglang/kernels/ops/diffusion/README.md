@@ -182,9 +182,11 @@ tensor copy per residual site.
 `usp_merge_heads`, `pack_qkv_destination_major`, `fused_pack_qkv`,
 `fused_pack_segmented_qkv`, `fused_scatter_to_padded`,
 `fused_causal_conv3d_cat_pad_cuda`,
-`cat_pad_channels_last_3d`, `dup_up3d_add`, `nearest_upsample_nhwc`,
+`cat_pad_channels_last_3d`, `dup_up3d_add`, `avg_down3d_add`, `nearest_upsample_nhwc`,
 `fused_temb_table_slices`,
-and `ltx2_ada_values9` are bit-exact data movement or same-order arithmetic.
+and `ltx2_ada_values9` are bit-exact data movement or same-order arithmetic
+(`avg_down3d_add` accumulates its group mean in fp32 in index order like
+aten's `mean`, so it matches the eager chain up to the reduction order).
 `fused_layernorm_modulate_fp8_quant_raw` folds FLUX.2 LayerNorm, adaLN
 modulation, and static FP8 quantization. `try_flux2_token_cat_fp8` and
 `try_flux2_token_cat_nvfp4` fuse branch concatenation directly into the
