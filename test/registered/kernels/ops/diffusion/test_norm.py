@@ -259,15 +259,23 @@ def test_native_bf16_rmsnorm_rejects_unsupported_inputs(on_host):
         (torch.bfloat16, torch.float32, 1.5e-1, 3e-2),  # Wan2.1 bf16 autocast
     ],
 )
-def test_wan_rmsnorm_silu_numerics(channels, x_dtype, affine_dtype, atol, rtol):
+@pytest.mark.parametrize("pre_bias", [False, True], ids=["plain", "pre_bias"])
+def test_wan_rmsnorm_silu_numerics(
+    channels, x_dtype, affine_dtype, atol, rtol, pre_bias
+):
     x = _cl3d((1, channels, 3, 10, 14), x_dtype)
     gamma = torch.randn((channels, 1, 1, 1), device=DEVICE, dtype=affine_dtype)
+    # A deferred conv bias enters through ``x.add_(bias)``: fp32 opmath, one
+    # rounding to x.dtype, before the statistics.
+    conv_bias = torch.randn_like(gamma) if pre_bias else None
+    normed = x if conv_bias is None else (x + conv_bias).to(x.dtype)
     for bias in (None, torch.randn_like(gamma)):
         expected = F.silu(
-            F.normalize(x, dim=1) * channels**0.5 * gamma
+            F.normalize(normed, dim=1) * channels**0.5 * gamma
             + (0 if bias is None else bias)
         )
-        actual = wan_rmsnorm_silu(x, gamma, bias)
+        assert can_use_wan_rmsnorm_silu(x, gamma, bias, conv_bias)
+        actual = wan_rmsnorm_silu(x, gamma, bias, pre_bias=conv_bias)
         assert actual.dtype == expected.dtype
         # The kernel must preserve the channels_last_3d layout; a relayout
         # here would undo the reason the decoder runs in that format.

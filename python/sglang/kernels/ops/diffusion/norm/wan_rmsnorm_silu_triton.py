@@ -13,6 +13,11 @@ params -- the autocast case), SiLU in fp32. Bitwise equality with aten is
 still not guaranteed (different reduction and SiLU paths), so callers must
 keep this behind an opt-in gate.  Support is a predicate
 (``can_use_wan_rmsnorm_silu``); the kernel raises on an unsupported input.
+
+``pre_bias`` lets the producing convolution defer its bias here: the kernel
+adds it per channel and rounds to ``x.dtype`` before taking the statistics,
+exactly the ``x.add_(bias)`` aten runs after ``cudnn_convolution``, so the
+separate broadcast add over the whole activation disappears.
 """
 
 from __future__ import annotations
@@ -34,11 +39,13 @@ def _wan_rmsnorm_silu_kernel(
     x_ptr,
     gamma_ptr,
     bias_ptr,
+    pre_bias_ptr,
     out_ptr,
     channels: tl.constexpr,
     rms_scale,
     eps,
     has_bias: tl.constexpr,
+    has_pre_bias: tl.constexpr,
     block_c: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -49,6 +56,11 @@ def _wan_rmsnorm_silu_kernel(
     row_offsets = row * channels + offsets
 
     x = tl.load(x_ptr + row_offsets, mask=mask, other=0.0).to(tl.float32)
+    if has_pre_bias:
+        # The producing conv's deferred bias: aten ``add_`` (fp32 opmath, one
+        # rounding to x.dtype) before anything else sees the activation.
+        pre_bias = tl.load(pre_bias_ptr + offsets, mask=mask, other=0.0)
+        x = (x + pre_bias.to(tl.float32)).to(x_ptr.dtype.element_ty).to(tl.float32)
     norm = tl.sqrt(tl.sum(x * x, axis=0))
     inv_norm = 1.0 / tl.maximum(norm, eps)
 
@@ -71,9 +83,11 @@ def _fake_wan_rmsnorm_silu(
     x: torch.Tensor,
     gamma: torch.Tensor,
     bias: torch.Tensor,
+    pre_bias: torch.Tensor,
     rms_scale: float,
     eps: float,
     has_bias: bool,
+    has_pre_bias: bool,
 ) -> torch.Tensor:
     dtype = torch.promote_types(x.dtype, gamma.dtype)
     return torch.empty_strided(x.shape, x.stride(), device=x.device, dtype=dtype)
@@ -87,9 +101,11 @@ def _triton_wan_rmsnorm_silu_cuda(
     x: torch.Tensor,
     gamma: torch.Tensor,
     bias: torch.Tensor,
+    pre_bias: torch.Tensor,
     rms_scale: float,
     eps: float,
     has_bias: bool,
+    has_pre_bias: bool,
 ) -> torch.Tensor:
     bsz, channels, t_size, h_size, w_size = x.shape
     # Preserve the input strides so the VAE keeps its channels_last_3d layout.
@@ -103,11 +119,13 @@ def _triton_wan_rmsnorm_silu_cuda(
             x,
             gamma,
             bias,
+            pre_bias,
             out,
             channels,
             rms_scale,
             eps,
             has_bias,
+            has_pre_bias,
             block_c,
             num_warps=num_warps,
         )
@@ -128,6 +146,7 @@ def can_use_wan_rmsnorm_silu(
     x: torch.Tensor,
     gamma: torch.Tensor,
     bias: torch.Tensor | None,
+    pre_bias: torch.Tensor | None = None,
 ) -> bool:
     return (
         x.is_cuda
@@ -143,6 +162,7 @@ def can_use_wan_rmsnorm_silu(
         and x.stride(1) == 1
         and _affine_supported(x, gamma)
         and (bias is None or _affine_supported(x, bias))
+        and (pre_bias is None or _affine_supported(x, pre_bias))
     )
 
 
@@ -152,22 +172,27 @@ def wan_rmsnorm_silu(
     bias: torch.Tensor | None = None,
     rms_scale: float | None = None,
     eps: float = 1e-12,
+    pre_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused ``SiLU(F.normalize(x, dim=1) * rms_scale * gamma + bias)``.
 
-    Guard with :func:`can_use_wan_rmsnorm_silu`.
+    ``pre_bias`` (one value per channel) is added to ``x`` first, with the
+    rounding of ``x.add_(pre_bias)``; it is the deferred bias of the conv
+    that produced ``x``. Guard with :func:`can_use_wan_rmsnorm_silu`.
     """
-    if not can_use_wan_rmsnorm_silu(x, gamma, bias):
+    if not can_use_wan_rmsnorm_silu(x, gamma, bias, pre_bias):
         raise ValueError("unsupported input for wan_rmsnorm_silu")
 
     channels = x.shape[1]
     gamma = gamma.reshape(channels).contiguous()
     has_bias = bias is not None
     bias = gamma if bias is None else bias.reshape(channels).contiguous()
+    has_pre_bias = pre_bias is not None
+    pre_bias = gamma if pre_bias is None else pre_bias.reshape(channels).contiguous()
     if rms_scale is None:
         rms_scale = channels**0.5
     return _triton_wan_rmsnorm_silu_cuda(
-        x, gamma, bias, float(rms_scale), eps, has_bias
+        x, gamma, bias, pre_bias, float(rms_scale), eps, has_bias, has_pre_bias
     )
 
 
