@@ -445,3 +445,77 @@ def test_vae_fast_path_keeps_names_and_lossless_output():
     finally:
         for handle in handles:
             handle.remove()
+
+
+@torch.no_grad()
+def test_vae_fast_path_folds_every_conv_bias(monkeypatch):
+    # With the gate on no conv in the decoder adds its bias inside aten: conv1's
+    # goes into the fused norm2 + SiLU, conv2's (with the shortcut's) into the
+    # residual epilogue, every other conv's into the vectorised epilogue.
+    import torch.nn.functional as F
+
+    import sglang.multimodal_gen.runtime.models.vaes.qwen_image21_vae_cuda_opt as opt
+    from sglang.multimodal_gen.configs.models.vaes.qwenimage21 import (
+        QwenImage21VAEArchConfig,
+        QwenImage21VAEConfig,
+    )
+    from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import (
+        AutoencoderKLQwenImage21,
+        QwenImage21ResidualBlock,
+    )
+    from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+        use_vae_fast_path,
+    )
+
+    ac = QwenImage21VAEArchConfig(
+        base_dim=8,
+        decoder_base_dim=8,
+        z_dim=4,
+        dim_mult=(1, 2, 2, 2, 2),
+        num_res_blocks=1,
+        temperal_downsample=(False, True, True, True),
+    )
+    torch.manual_seed(0)
+    vae = AutoencoderKLQwenImage21(QwenImage21VAEConfig(arch_config=ac))
+    vae = opt.maybe_optimize_qwen_image21_vae(vae.cuda().bfloat16().eval())
+    blocks = [
+        m for m in vae.decoder.modules() if isinstance(m, QwenImage21ResidualBlock)
+    ]
+    shortcuts = sum(isinstance(b.conv_shortcut, torch.nn.Conv2d) for b in blocks)
+    assert blocks and shortcuts, "config must exercise a conv_shortcut"
+
+    conv_calls, epilogues, norm_pre_bias = [], [], []
+    real_conv2d, real_epilogue, real_norm = (
+        F.conv2d,
+        opt.conv_bias_epilogue,
+        opt.wan_rmsnorm_silu,
+    )
+
+    def conv2d(x, weight, bias=None, *args, **kwargs):
+        conv_calls.append(bias is not None)
+        return real_conv2d(x, weight, bias, *args, **kwargs)
+
+    def epilogue(y, bias, residual=None, residual_bias=None):
+        epilogues.append((residual is not None, residual_bias is not None))
+        return real_epilogue(y, bias, residual, residual_bias)
+
+    def norm(x, gamma, bias, **kwargs):
+        norm_pre_bias.append(kwargs.get("pre_bias") is not None)
+        return real_norm(x, gamma, bias, **kwargs)
+
+    monkeypatch.setattr(F, "conv2d", conv2d)
+    monkeypatch.setattr(opt, "conv_bias_epilogue", epilogue)
+    monkeypatch.setattr(opt, "wan_rmsnorm_silu", norm)
+    latent = torch.randn(1, 4, 1, 4, 6, device="cuda", dtype=torch.bfloat16)
+    with use_vae_fast_path(vae, True):
+        vae.decoder(latent, first_chunk=True)
+    assert len(conv_calls) >= 2 * len(blocks) and not any(conv_calls)
+    # one residual epilogue per block, the shortcut bias folded where there is one
+    assert sum(residual for residual, _ in epilogues) == len(blocks)
+    assert sum(with_bias for _, with_bias in epilogues) == shortcuts
+    # conv1's bias absorbed by the fused norm2 in every block, nowhere else
+    assert sum(norm_pre_bias) == len(blocks)
+    # with the gate off the convs add their own bias again
+    conv_calls.clear()
+    vae.decoder(latent, first_chunk=True)
+    assert conv_calls and all(conv_calls)
