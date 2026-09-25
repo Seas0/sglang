@@ -11,8 +11,10 @@ a separate broadcast ``add_`` over the whole activation, so inside a residual
 block the bias of ``conv1`` is deferred into the fused RMSNorm+SiLU that
 consumes it, and the bias of ``conv2``, the bias of ``conv_shortcut`` and the
 residual add run as one bit-exact epilogue pass; the up blocks' upsample conv
-defers its bias into the fused ``main + DupUp3D(src)`` add. With the gate off
-the original module code runs bit-for-bit. Installed once at VAE load;
+defers its bias into the fused ``main + DupUp3D(src)`` add, and the encoder's
+down blocks pad in channels_last and run ``x + AvgDown3D(x_copy)`` as one fused
+pass with the downsample conv's bias folded in. With the gate off the original
+module code runs bit-for-bit. Installed once at VAE load;
 all-or-nothing and fail-closed like the Wan-family path.
 """
 
@@ -22,9 +24,11 @@ import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import (
     AutoencoderKLQwenImage21,
+    QwenImage21AvgDown3D,
     QwenImage21CausalConv3d,
     QwenImage21DupUp3D,
     QwenImage21ResidualBlock,
+    QwenImage21ResidualDownBlock,
     QwenImage21ResidualUpBlock,
     QwenImage21RMS_norm,
     QwenImage21Upsample,
@@ -42,6 +46,7 @@ logger = init_logger(__name__)
 
 try:
     from sglang.kernels.ops.diffusion import (
+        avg_down3d_add,
         can_use_conv_bias_epilogue,
         can_use_wan_rmsnorm_silu,
         conv_bias_epilogue,
@@ -183,6 +188,43 @@ class _GatedConv2d(nn.Conv2d):
         return _conv_epilogue(y, bias, None, None)
 
 
+class _GatedZeroPad2d(nn.ZeroPad2d):
+    """``nn.ZeroPad2d`` (the downsamplers' asymmetric ``(0, 1, 0, 1)`` pad)
+    that pads a channels_last input in channels_last while the gate is on.
+    aten's ``constant_pad_nd`` writes an NCHW-contiguous result, so on an NHWC
+    activation it is a strided copy with 16x read amplification, followed by
+    the conv's own conversion back to NHWC; this touches the border and the
+    interior once and keeps the layout. Pure data movement, bit-exact."""
+
+    def forward(self, x):
+        if (
+            not self._sgl_gate.enabled
+            or torch.compiler.is_compiling()
+            or x.dim() != 4
+            or not x.is_contiguous(memory_format=torch.channels_last)
+            or min(self.padding) < 0
+        ):
+            return nn.ZeroPad2d.forward(self, x)
+        left, right, top, bottom = self.padding
+        n, c, h, w = x.shape
+        out = torch.empty(
+            (n, c, h + top + bottom, w + left + right),
+            dtype=x.dtype,
+            device=x.device,
+            memory_format=torch.channels_last,
+        )
+        if top:
+            out[:, :, :top].zero_()
+        if bottom:
+            out[:, :, top + h :].zero_()
+        if left:
+            out[:, :, :, :left].zero_()
+        if right:
+            out[:, :, :, left + w :].zero_()
+        out[:, :, top : top + h, left : left + w].copy_(x)
+        return out
+
+
 class _GatedRMSNormSiLU(QwenImage21RMS_norm):
     """``QwenImage21RMS_norm`` that is always followed by SiLU. With the gate
     on it applies the SiLU itself (fused when the layout allows) and the
@@ -272,6 +314,40 @@ class _GatedResidualUpBlock(QwenImage21ResidualUpBlock):
         return x + shortcut(x_copy, first_chunk=first_chunk)
 
 
+class _GatedResidualDownBlock(QwenImage21ResidualDownBlock):
+    """``QwenImage21ResidualDownBlock`` whose ``x + AvgDown3D(x_copy)`` runs
+    as one fused pass over the channels_last activation while the gate is on,
+    with the downsample conv's bias deferred into it: the encoder mirror of
+    :class:`_GatedResidualUpBlock`. The eager shortcut materialises a padded
+    and a pixel-unshuffled copy, both read with 16x sector amplification on an
+    NHWC input."""
+
+    def forward(self, x, feat_cache=None, feat_idx=None):
+        if not self._sgl_gate.enabled or torch.compiler.is_compiling():
+            return QwenImage21ResidualDownBlock.forward(self, x, feat_cache, feat_idx)
+        x_copy = x
+        for resnet in self.resnets:
+            x = resnet(x)
+        bias = None
+        if self.downsampler is not None:
+            x = self.downsampler(x)  # raw: its conv carries ``_sgl_defer_bias``
+            bias = self.downsampler.resample[1].bias
+        shortcut = self.avg_shortcut
+        fused = avg_down3d_add(
+            x,
+            x_copy,
+            shortcut.factor_t,
+            shortcut.factor_s,
+            shortcut.out_channels,
+            main_bias=bias,
+        )
+        if fused is not None:
+            return fused
+        if bias is not None:
+            x = _add_bias(x, bias)
+        return x + shortcut(x_copy)
+
+
 def _norm_silu_pairs(part: nn.Module) -> list[tuple[nn.Module, str, nn.Module, str]]:
     """(owner, norm attribute, owner, activation attribute) for every
     ``RMS_norm -> SiLU`` chain of an encoder or decoder; ``[]`` if any chain
@@ -352,6 +428,27 @@ def _install(part: nn.Module, gate: VaeFastPathGate) -> tuple[int, int, int] | N
             continue
         seq[1]._sgl_defer_bias = True
         m.__class__ = _GatedResidualUpBlock
+        m._sgl_gate = gate
+    for m in part.modules():
+        if not (
+            type(m) is QwenImage21ResidualDownBlock
+            and type(m.avg_shortcut) is QwenImage21AvgDown3D
+        ):
+            continue
+        if m.downsampler is not None:
+            seq = getattr(m.downsampler, "resample", None)
+            if not (
+                isinstance(seq, nn.Sequential)
+                and len(seq) == 2
+                and type(seq[0]) is nn.ZeroPad2d
+                and type(seq[1]) is _GatedConv2d
+                and seq[1].bias is not None
+            ):
+                continue
+            seq[0].__class__ = _GatedZeroPad2d
+            seq[0]._sgl_gate = gate
+            seq[1]._sgl_defer_bias = True
+        m.__class__ = _GatedResidualDownBlock
         m._sgl_gate = gate
     return len(pairs), convs, upsamples
 

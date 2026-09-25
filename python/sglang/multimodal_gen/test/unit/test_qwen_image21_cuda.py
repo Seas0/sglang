@@ -532,3 +532,41 @@ def test_vae_fast_path_folds_every_conv_bias(monkeypatch):
     conv_calls.clear()
     vae.decoder(latent, first_chunk=True)
     assert conv_calls and all(conv_calls)
+
+    # The encoder mirrors it: no aten pad (neither the downsamplers' ZeroPad2d
+    # nor AvgDown3D's frame pad), one fused AvgDown3D add per down block with
+    # the downsample conv's bias folded where there is one.
+    from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import (
+        QwenImage21ResidualDownBlock,
+    )
+
+    down_blocks = [
+        m for m in vae.encoder.modules() if isinstance(m, QwenImage21ResidualDownBlock)
+    ]
+    assert down_blocks and all(
+        isinstance(m, opt._GatedResidualDownBlock) for m in down_blocks
+    )
+    pads, avg_adds = [], []
+    real_pad, real_avg = F.pad, opt.avg_down3d_add
+
+    def pad(*args, **kwargs):
+        pads.append(True)
+        return real_pad(*args, **kwargs)
+
+    def avg_add(main, src, *args, main_bias=None):
+        avg_adds.append(main_bias is not None)
+        return real_avg(main, src, *args, main_bias=main_bias)
+
+    monkeypatch.setattr(F, "pad", pad)
+    monkeypatch.setattr(opt, "avg_down3d_add", avg_add)
+    pixels = torch.randn(1, 4, 1, 64, 96, device="cuda", dtype=torch.bfloat16)
+    conv_calls.clear()
+    with use_vae_fast_path(vae, True):
+        vae.encoder(pixels)
+    assert conv_calls and not any(conv_calls) and not pads
+    assert len(avg_adds) == len(down_blocks)
+    assert sum(avg_adds) == sum(b.downsampler is not None for b in down_blocks)
+    # the gate-off encoder pads and adds biases in aten again
+    conv_calls.clear()
+    vae.encoder(pixels)
+    assert conv_calls and all(conv_calls) and pads

@@ -137,7 +137,12 @@ framework-specific optimization workflow.
   goes into `dup_up3d_add(main_bias=...)`, and the remaining convs use the
   bias-only epilogue. All of those reproduce aten's arithmetic bit for bit,
   so they change no pixel of the gated path; what is left in decode is the
-  cuDNN convs themselves (about 86% of GPU time on a 4090).
+  cuDNN convs themselves (about 86% of GPU time on a 4090). The encoder's
+  down blocks pad in channels_last (`_GatedZeroPad2d`) and run
+  `x + AvgDown3D(x_copy)` as `avg_down3d_add` with the downsample conv's
+  bias folded in: on an NHWC activation the eager pad and pixel-unshuffle
+  copies read with 16x sector amplification (about 40% of encode on a 4090,
+  visible in ncu as `at::elementwise_kernel` launches at 40% DRAM peak).
 - Do not confuse request `--quality` with `--output-quality`, which controls
   output-file compression rather than model math.
 - Validation: `test/registered/kernels/ops/diffusion/test_sites.py`,
