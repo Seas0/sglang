@@ -128,6 +128,7 @@ Several norms look interchangeable and are not. Start here.
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|
 | `residual_gate_add` | KDA (JIT CUDA) | bit-exact `residual + update * gate` | contiguous tensors, or a transposed-dense `[B, tokens, hidden]` residual/output with contiguous update and row-broadcast gate (SANA-Video) |
+| `conv_bias_epilogue` | Triton | bit-exact vs aten `conv_out.add_(bias)` (+ `residual`, whose own conv bias may be folded too) | dense channels_last(_3d) conv outputs; the Qwen-Image 2.1 VAE residual blocks run their conv bias, shortcut bias and residual add as one pass |
 
 The transposed-dense path uses a shared-memory tile to read the update in
 logical row-major order while keeping residual reads and output writes

@@ -197,6 +197,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Bit-exact adaLN modulate x * (1 + scale) + shift.",
     ),
     (
+        "diffusion.conv_bias_epilogue",
+        KernelBackend.TRITON,
+        "modulate.conv_bias_epilogue_triton:conv_bias_epilogue",
+        _CUDA,
+        "Bit-exact channels_last conv bias (+ residual) epilogue.",
+    ),
+    (
         "diffusion.residual_gate_add",
         KernelBackend.KDA,
         "sglang.kernels.kda_kernels.residual_gate_add_jit:residual_gate_add",
@@ -596,6 +603,8 @@ _EXPORTS: dict[str, str] = {
     "can_use_qk_rmsnorm_native": "norm.zimage_qk_rmsnorm_triton",
     "zimage_qk_rmsnorm_native": "norm.zimage_qk_rmsnorm_triton",
     # adaLN modulation, gating and timestep conditioning
+    "can_use_conv_bias_epilogue": "modulate.conv_bias_epilogue_triton",
+    "conv_bias_epilogue": "modulate.conv_bias_epilogue_triton",
     "indexed_gate_bf16": "modulate.indexed_modulation_triton",
     "indexed_gate_bf16_": "modulate.indexed_modulation_triton",
     "indexed_scale_shift_bf16_": "modulate.indexed_modulation_triton",
